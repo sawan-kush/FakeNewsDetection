@@ -1,100 +1,83 @@
-"""Minimal Groq (OpenAI-compatible) chat client returning parsed JSON."""
-from __future__ import annotations
-
+import os
 import json
-import re
-import time
+import logging
+from groq import Groq
 
-import requests
+logger = logging.getLogger(__name__)
 
-
-class LLMError(RuntimeError):
-    def __init__(self, kind: str, detail: str = ""):
-        super().__init__(f"{kind}: {detail}" if detail else kind)
-        self.kind = kind  # missing_key | rate_limited | timeout | http_error | invalid_output | network_error
-
-
-def parse_json_text(text: str) -> dict:
-    """Parse model output as a JSON object, tolerating ```json fences or leading/trailing prose."""
-    if not isinstance(text, str) or not text.strip():
-        raise LLMError("invalid_output", "empty response")
-    t = text.strip()
-    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I)
-    try:
-        obj = json.loads(t)
-    except ValueError:
-        m = re.search(r"\{.*\}", t, re.S)
-        if not m:
-            raise LLMError("invalid_output", "no JSON object found")
-        try:
-            obj = json.loads(m.group(0))
-        except ValueError as exc:
-            raise LLMError("invalid_output", "malformed JSON") from exc
-    if not isinstance(obj, dict):
-        raise LLMError("invalid_output", "JSON root is not an object")
-    return obj
-
+class LLMError(Exception):
+    pass
 
 class GroqClient:
-    def __init__(self, api_key: str, model: str, base_url: str, timeout: float = 45.0, session=None):
-        self.key, self.model, self.base, self.timeout = api_key, model, base_url, timeout
-        self.session = session or requests.Session()
+    def __init__(self, api_key: str = None, model: str = None, api_base: str = None):
+        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        self.model = model or os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        
+        if self.api_key:
+            kwargs = {"api_key": self.api_key}
+            # Clean up base URL if accidentally duplicated
+            if api_base:
+                base = api_base.split("/openai/v1")[0]
+                kwargs["base_url"] = base
+            self.client = Groq(**kwargs)
+        else:
+            self.client = None
 
     @property
     def configured(self) -> bool:
-        return bool(self.key)
+        return bool(self.api_key)
 
-    def chat_json(self, system: str, user: str, temperature: float = 0.0, max_tokens: int = 2500) -> dict:
-        if not self.key:
-            raise LLMError("missing_key", "GROQ_API_KEY is not set")
+    def chat_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.1, **kwargs) -> dict:
+        if not self.configured or not self.client:
+            raise LLMError("GROQ_API_KEY is missing or client is not configured.")
+
         payload = {
             "model": self.model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             "temperature": temperature,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
+            "response_format": {"type": "json_object"}
         }
-        if "gpt-oss" in self.model:
-            # reasoning tokens count against max_tokens and the per-minute quota; keep them small
-            payload["reasoning_effort"] = "low"
-        last: Exception | None = None
-        for attempt in range(3):
-            try:
-                r = self.session.post(self.base, json=payload, timeout=self.timeout,
-                                      headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
-            except requests.Timeout as exc:
-                last = LLMError("timeout")
-                continue
-            except requests.RequestException as exc:
-                raise LLMError("network_error", type(exc).__name__) from exc
-            if r.status_code == 429 and attempt < 2:
-                try:
-                    wait = float(r.headers.get("retry-after", 3) or 3)
-                except ValueError:
-                    wait = 3.0
-                time.sleep(min(max(wait, 2.0), 15.0))
-                last = LLMError("rate_limited")
-                continue
-            if r.status_code == 429:
-                raise LLMError("rate_limited", "Groq rate limit reached")
-            if r.status_code in (401, 403):
-                raise LLMError("http_error", f"authentication failed ({r.status_code}); check GROQ_API_KEY")
-            if r.status_code >= 500 and attempt < 2:
-                last = LLMError("http_error", str(r.status_code))
-                continue
-            if r.status_code >= 400:
-                detail = ""
-                try:
-                    detail = r.json().get("error", {}).get("message", "")[:200]
-                except Exception:
-                    pass
-                raise LLMError("http_error", f"{r.status_code} {detail}".strip())
-            try:
-                choice = r.json()["choices"][0]
-                content = choice["message"]["content"]
-            except (ValueError, KeyError, IndexError, TypeError) as exc:
-                raise LLMError("invalid_output", "unexpected response envelope") from exc
-            if not (content or "").strip() and choice.get("finish_reason") == "length":
-                raise LLMError("invalid_output", "model ran out of tokens before answering (truncated)")
-            return parse_json_text(content)
-        raise last or LLMError("http_error")
+        
+        if "max_tokens" in kwargs and kwargs["max_tokens"]:
+            payload["max_tokens"] = kwargs["max_tokens"]
+
+        try:
+            response = self.client.chat.completions.create(**payload)
+            content = response.choices[0].message.content
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"Groq API error: {e}")
+            if "rate_limit" in str(e).lower():
+                raise LLMError("rate_limited: Groq rate limit reached")
+            raise LLMError(str(e))
+
+    def verify_claim(self, text: str, search_evidence: str = "") -> dict:
+        prompt = f"""You are a strict fact-checker. Analyze the following news claim and web search evidence to determine if the news is correct, false, or misleading.
+
+News / Claim:
+"{text}"
+
+Web Search Evidence:
+{search_evidence if search_evidence else "No external search evidence available."}
+
+Respond ONLY with a valid JSON object in this exact format (no markdown formatting outside JSON):
+{{
+    "verdict": "correct" (or "false" or "misleading" or "unverified"),
+    "confidence": 85,
+    "summary": "A concise 2-3 sentence explanation explaining why this claim is correct or false based on the evidence."
+}}"""
+        return self.chat_json("You are a precise fact-checking assistant that outputs strict JSON.", prompt)
+
+def verify_news_with_groq(text: str, search_evidence: str = "") -> dict:
+    try:
+        client = GroqClient()
+        return client.verify_claim(text, search_evidence)
+    except Exception as e:
+        return {
+            "verdict": "unverified",
+            "confidence": 0,
+            "summary": f"Verification error: {str(e)}"
+        }
