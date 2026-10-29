@@ -38,23 +38,44 @@ function VerdictBanner({ r }: { r: AnalysisResult }) {
 
 function MlCard({ r }: { r: AnalysisResult }) {
   const m = r.ml.result;
+  const lowConf = !!m && m.probability < 0.7;
+  const headlineOnly = r.mode === "headline";
+  const verifiedTrue = r.verification.status === "ok" && r.verification.verdict === "supported";
+  const conflict = !!m && m.label === "fake" && verifiedTrue;
+  // Mute the colour when the signal is weak or contradicts the evidence-based verdict.
+  const muted = lowConf || conflict;
+  const labelClass = muted ? "text-slate-600" : m?.label === "fake" ? "text-verdict-contradicted" : "text-teal-700";
   return (
     <section className="card p-5" aria-labelledby="ml-title">
       <h3 id="ml-title" className="text-lg font-medium">Writing style</h3>
-      <p className="text-xs text-ink-muted">Not a fact-check</p>
+      <p className="text-xs text-ink-muted">Secondary signal, not a fact-check</p>
       {r.ml.available && m ? (
         <>
           <p className="mt-4 text-2xl font-medium">
-            Resembles <span className={m.label === "fake" ? "text-verdict-contradicted" : "text-teal-700"}>{m.label}</span> news
+            {lowConf ? (
+              <span className="text-slate-600">Style is inconclusive</span>
+            ) : (
+              <>Resembles <span className={labelClass}>{m.label}</span> news</>
+            )}
           </p>
-          <div className="mt-3" role="img" aria-label={`${pct(m.probabilities.fake, 0)} fake, ${pct(m.probabilities.real, 0)} real`}>
+          <div className={`mt-3 ${muted ? "opacity-60" : ""}`} role="img" aria-label={`${pct(m.probabilities.fake, 0)} fake, ${pct(m.probabilities.real, 0)} real`}>
             <div className="flex h-2 overflow-hidden rounded-full bg-slate-100">
               <div className="bg-verdict-contradicted/80" style={{ width: pct(m.probabilities.fake, 1) }} />
               <div className="bg-teal-600/80" style={{ width: pct(m.probabilities.real, 1) }} />
             </div>
             <div className="mt-1.5 flex justify-between text-xs tabular-nums text-ink-muted"><span>Fake {pct(m.probabilities.fake, 0)}</span><span>Real {pct(m.probabilities.real, 0)}</span></div>
           </div>
-          {m.probability < 0.7 && <p className="mt-3 text-sm text-verdict-mixed">Low confidence: treat this as a rough hint only.</p>}
+          {lowConf && <p className="mt-3 text-sm text-verdict-mixed">Low confidence: treat this as a rough hint only.</p>}
+          {conflict && (
+            <p className="mt-3 text-sm leading-relaxed text-ink-soft">
+              The sources above support this claim. A style score cannot judge whether something is true, so rely on the evidence-based verdict.
+            </p>
+          )}
+          {headlineOnly && (
+            <p className="mt-3 text-sm leading-relaxed text-ink-soft">
+              A single headline gives this check very little to work with, and it was trained on older articles, so it can misjudge recent news.
+            </p>
+          )}
           <p className="mt-4 text-sm leading-relaxed text-ink-soft">This only looks at how the text is written, not whether it is true.</p>
         </>
       ) : (
