@@ -32,11 +32,14 @@ class Config:
     # --- secrets / external services -------------------------------------
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))
     groq_model: str = field(default_factory=lambda: os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
-    # Groq's built-in web search runs inside "compound" models (single tool call, low latency)
-    groq_search_model: str = field(default_factory=lambda: os.getenv("GROQ_SEARCH_MODEL", "groq/compound-mini"))
     groq_api_base: str = field(
         default_factory=lambda: os.getenv("GROQ_API_BASE", "https://api.groq.com/openai/v1/chat/completions")
     )
+
+    # Web search is done by Tavily (https://app.tavily.com), so it uses no Groq tokens
+    tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
+    tavily_api_base: str = field(default_factory=lambda: os.getenv("TAVILY_API_BASE", "https://api.tavily.com/search"))
+    tavily_search_depth: str = field(default_factory=lambda: os.getenv("TAVILY_SEARCH_DEPTH", "basic"))  # basic=1 credit, advanced=2
 
     # --- paths ------------------------------------------------------------
     artifact_dir: Path = field(

@@ -1,13 +1,13 @@
-"""Web search through Groq's built-in search tool (Compound models).
+"""Web search through Groq's built-in browser_search tool (gpt-oss models).
 
-A compound model performs the web search itself and returns the raw results in
-``choices[0].message.executed_tools[*].search_results.results``. We use ONLY those structured
-results (real titles, URLs and page excerpts) as candidate evidence. The model's own prose answer is
-ignored, so nothing it writes can become "evidence".
+The model performs the web search itself; we use ONLY the structured results it executed
+(real titles, URLs and page excerpts) as candidate evidence. The model's prose answer is ignored,
+so nothing it writes can become "evidence".
 """
 from __future__ import annotations
 
 import re
+import time
 
 import requests
 
@@ -15,7 +15,7 @@ import requests
 class SearchError(RuntimeError):
     def __init__(self, kind: str, detail: str = ""):
         super().__init__(f"{kind}: {detail}" if detail else kind)
-        self.kind = kind  # missing_key | rate_limited | timeout | http_error | bad_response | network_error
+        self.kind = kind  # missing_key | rate_limited | timeout | http_error | bad_response | no_results | network_error
 
 
 _PARA = re.compile(r"\n{1,}|(?<=[.!?])\s{2,}")
@@ -61,13 +61,22 @@ def parse_compound_response(data: dict) -> list[dict]:
 
 
 class GroqSearchClient:
-    def __init__(self, api_key: str, model: str, base_url: str, timeout: float = 40.0, session=None):
+    def __init__(self, api_key: str, model: str, base_url: str, timeout: float = 60.0, session=None):
         self.key, self.model, self.base, self.timeout = api_key, model, base_url, timeout
         self.session = session or requests.Session()
 
     @property
     def configured(self) -> bool:
         return bool(self.key)
+
+    def _post(self, payload: dict) -> requests.Response:
+        try:
+            return self.session.post(self.base, json=payload, timeout=self.timeout,
+                                     headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
+        except requests.Timeout as exc:
+            raise SearchError("timeout") from exc
+        except requests.RequestException as exc:
+            raise SearchError("network_error", type(exc).__name__) from exc
 
     def search(self, query: str, count: int = 6) -> list[dict]:
         if not self.key:
@@ -78,16 +87,23 @@ class GroqSearchClient:
                 {"role": "system", "content": "You are a search assistant. Always use web search. Reply in one short sentence."},
                 {"role": "user", "content": f"Search the web for reliable sources about: {query[:300]}"},
             ],
+            "tools": [{"type": "browser_search"}],
+            "tool_choice": "required",
             "temperature": 0,
-            "max_tokens": 120,
+            "max_tokens": 1500,  # reasoning models spend tokens thinking before/after the tool call
         }
-        try:
-            r = self.session.post(self.base, json=payload, timeout=self.timeout,
-                                  headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
-        except requests.Timeout as exc:
-            raise SearchError("timeout") from exc
-        except requests.RequestException as exc:
-            raise SearchError("network_error", type(exc).__name__) from exc
+        r = None
+        for attempt in range(3):  # retry rate limits / transient server errors
+            r = self._post(payload)
+            if r.status_code == 429 or r.status_code >= 500:
+                if attempt < 2:
+                    try:
+                        wait = float(r.headers.get("retry-after", 2 * (attempt + 1)))
+                    except ValueError:
+                        wait = 2 * (attempt + 1)
+                    time.sleep(min(wait, 8))
+                    continue
+            break
         if r.status_code == 429:
             raise SearchError("rate_limited", "Groq rate limit reached")
         if r.status_code in (401, 403):
@@ -103,4 +119,7 @@ class GroqSearchClient:
             results = parse_compound_response(r.json())
         except ValueError as exc:
             raise SearchError("bad_response", "invalid JSON") from exc
+        if not results:
+            # Make "model didn't search / returned nothing" visible instead of looking like success.
+            raise SearchError("no_results", "search tool returned no results")
         return results[: max(1, count)]

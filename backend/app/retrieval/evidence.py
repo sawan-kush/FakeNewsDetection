@@ -5,7 +5,7 @@ import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-from app.retrieval.groq_search import SearchError
+from app.retrieval.tavily_search import SearchError
 from app.retrieval.fetcher import FetchError, SafeFetcher
 from app.retrieval.sources import TIER_WEIGHT, classify_source, normalize_url
 

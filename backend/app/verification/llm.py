@@ -54,8 +54,11 @@ class GroqClient:
             "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
         }
+        if "gpt-oss" in self.model:
+            # reasoning tokens count against max_tokens and the per-minute quota; keep them small
+            payload["reasoning_effort"] = "low"
         last: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 r = self.session.post(self.base, json=payload, timeout=self.timeout,
                                       headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
@@ -64,15 +67,19 @@ class GroqClient:
                 continue
             except requests.RequestException as exc:
                 raise LLMError("network_error", type(exc).__name__) from exc
-            if r.status_code == 429 and attempt == 0:
-                time.sleep(min(float(r.headers.get("retry-after", 2) or 2), 5))
+            if r.status_code == 429 and attempt < 2:
+                try:
+                    wait = float(r.headers.get("retry-after", 3) or 3)
+                except ValueError:
+                    wait = 3.0
+                time.sleep(min(max(wait, 2.0), 15.0))
                 last = LLMError("rate_limited")
                 continue
             if r.status_code == 429:
                 raise LLMError("rate_limited", "Groq rate limit reached")
             if r.status_code in (401, 403):
                 raise LLMError("http_error", f"authentication failed ({r.status_code}); check GROQ_API_KEY")
-            if r.status_code >= 500 and attempt == 0:
+            if r.status_code >= 500 and attempt < 2:
                 last = LLMError("http_error", str(r.status_code))
                 continue
             if r.status_code >= 400:
@@ -83,8 +90,11 @@ class GroqClient:
                     pass
                 raise LLMError("http_error", f"{r.status_code} {detail}".strip())
             try:
-                content = r.json()["choices"][0]["message"]["content"]
+                choice = r.json()["choices"][0]
+                content = choice["message"]["content"]
             except (ValueError, KeyError, IndexError, TypeError) as exc:
                 raise LLMError("invalid_output", "unexpected response envelope") from exc
+            if not (content or "").strip() and choice.get("finish_reason") == "length":
+                raise LLMError("invalid_output", "model ran out of tokens before answering (truncated)")
             return parse_json_text(content)
         raise last or LLMError("http_error")

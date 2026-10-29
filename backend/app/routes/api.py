@@ -30,7 +30,8 @@ def health():
     return jsonify({
         "status": "ok",
         "model": {"available_modes": modes, "trained": len(modes) == 3, "smoke_test": smoke},
-        "services": {"search_and_verification": s.llm.configured},
+        "services": {"search_and_verification": s.llm.configured and s.searcher.configured,
+                     "search": s.searcher.configured, "verification": s.llm.configured},
         "history_enabled": s.history is not None,
         "limits": {"headline_max": cfg.headline_max, "headline_min": cfg.headline_min,
                    "article_max": cfg.article_max, "article_min": cfg.article_min},

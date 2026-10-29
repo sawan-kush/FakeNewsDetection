@@ -14,7 +14,7 @@ from app.ml.predictor import ModelUnavailable, Predictor
 from app.retrieval import evidence as ev
 from app.retrieval.claims import extract_claims
 from app.retrieval.fetcher import SafeFetcher
-from app.retrieval.groq_search import GroqSearchClient, SearchError
+from app.retrieval.tavily_search import SearchError, TavilySearchClient
 from app.retrieval.sources import QUALITY_LEGEND
 from app.verification.llm import GroqClient, LLMError
 from app.verification.verifier import VERDICT_LABELS, verify
@@ -105,7 +105,7 @@ class Job:
 class AnalysisService:
     def __init__(self, cfg: Config, predictor: Predictor, history=None, searcher=None, llm=None, fetcher=None):
         self.cfg, self.predictor, self.history = cfg, predictor, history
-        self.searcher = searcher or GroqSearchClient(cfg.groq_api_key, cfg.groq_search_model, cfg.groq_api_base)
+        self.searcher = searcher or TavilySearchClient(cfg.tavily_api_key, cfg.tavily_api_base, cfg.tavily_search_depth)
         self.llm = llm or GroqClient(cfg.groq_api_key, cfg.groq_model, cfg.groq_api_base)
         self.fetcher = fetcher or SafeFetcher(cfg.http_timeout, cfg.max_page_bytes, cfg.user_agent, cfg.respect_robots)
         self.jobs: dict[str, Job] = {}
