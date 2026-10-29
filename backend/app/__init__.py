@@ -1,26 +1,23 @@
-"""TruthLens backend application factory."""
+﻿"""Fake-news checker backend (Flask + Groq web search)."""
 from __future__ import annotations
 
 import logging
 
 from flask import Flask, jsonify
+from flask_cors import CORS
 
 from app.config import Config, get_config
-from app.history.store import HistoryStore
-from app.ml.predictor import Predictor
 from app.routes.api import bp as api_bp
-from app.services import AnalysisService
+from app.services import FactCheckService
 
 
-def create_app(cfg: Config | None = None, service: AnalysisService | None = None) -> Flask:
+def create_app(cfg: Config | None = None, service: FactCheckService | None = None) -> Flask:
     cfg = cfg or get_config()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app = Flask(__name__)
-    app.config["MAX_CONTENT_LENGTH"] = 200 * 1024  # request bodies above this get 413
-    if service is None:
-        history = HistoryStore(cfg.history_db)
-        service = AnalysisService(cfg, Predictor(cfg.artifact_dir), history)
-    app.extensions["truthlens"] = service
+    app.config["MAX_CONTENT_LENGTH"] = 200 * 1024
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    app.extensions["factcheck"] = service or FactCheckService(cfg)
     app.register_blueprint(api_bp)
 
     @app.errorhandler(413)

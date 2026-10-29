@@ -1,144 +1,74 @@
+from unittest.mock import MagicMock
+
 import pytest
 
-from app.retrieval.brave import SearchError
-from app.verification.llm import LLMError
-from tests.conftest import CLAIMS_JSON, VERDICT_JSON, FakeBrave, FakeLLM
-
-H = "Chandrayaan-3 landed on the Moon in 2024."
-BODY = "Chandrayaan-3 landed on the Moon in 2024, officials said on Monday. " * 2
+from app import create_app
+from app.config import Config
+from app.services import FactCheckService, _extract_json
 
 
-def post(client, **kw):
-    return client.post("/api/analyze", json={"wait": True, **kw})
+def fake_response(content, results=None, status=200):
+    r = MagicMock()
+    r.status_code = status
+    r.headers = {}
+    r.json.return_value = {"choices": [{"message": {
+        "content": content,
+        "executed_tools": [{"type": "search", "search_results": {"results": results or []}}],
+    }}]}
+    return r
 
 
-@pytest.mark.parametrize("payload", [
-    {"mode": "headline", "headline": H},
-    {"mode": "article", "text": BODY},
-    {"mode": "both", "headline": H, "text": BODY}])
-def test_all_input_modes_full_pipeline(client_factory, payload):
-    c, _ = client_factory()
-    r = post(c, **payload)
+def make_client(resp):
+    session = MagicMock()
+    session.post.return_value = resp
+    cfg = Config(groq_api_key="test-key")
+    return create_app(cfg, FactCheckService(cfg, session)).test_client(), session
+
+
+GOOD = ('Here you go:\n```json\n{"verdict":"false","confidence":92,"summary":"It did not happen.",'
+        '"claims":[{"claim":"X","verdict":"false","explanation":"No."}],'
+        '"sources":[{"title":"Reuters","url":"https://reuters.com/a"},{"title":"Fake","url":"https://made-up.example"}]}\n```')
+
+
+def test_happy_path_filters_invented_sources():
+    c, session = make_client(fake_response(GOOD, [{"title": "Reuters", "url": "https://reuters.com/a"}]))
+    r = c.post("/api/analyze", json={"text": "Some news claim to check please"})
     assert r.status_code == 200
     d = r.get_json()
-    assert d["mode"] == payload["mode"] and d["ml"]["available"] and d["ml"]["result"]["mode"] == payload["mode"]
-    v = d["verification"]
-    assert v["status"] == "ok" and v["verdict"] == "contradicted" and v["verdict_label"] == "Contradicted by evidence"
-    assert d["claims"][0]["correction"] and d["claims"][0]["assessments"][0]["evidence_id"] == "E1"
-    assert d["evidence"][0]["domain"] == "isro.gov.in" and "2023" in d["evidence"][0]["passages"][0]["text"]
-    assert d["quality_legend"]["official"]
+    assert d["verdict"] == "false" and d["confidence"] == 92 and d["searched"] is True
+    assert [s["url"] for s in d["sources"]] == ["https://reuters.com/a"]
+    assert session.post.call_args.kwargs["json"]["tools"] == [{"type": "browser_search"}]
 
 
-@pytest.mark.parametrize("payload,fragment", [
-    ({}, "mode"), ({"mode": "x"}, "mode"), ({"mode": "headline"}, "required"), ({"mode": "headline", "headline": "short"}, "short"),
-    ({"mode": "article", "text": "tiny"}, "short"), ({"mode": "both", "headline": H}, "required"),
-    ({"mode": "headline", "headline": "x" * 400}, "long"), ({"mode": "article", "text": "x " * 11000}, "long"),
-    ({"mode": "headline", "headline": 123}, "string")])
-def test_validation_errors(client_factory, payload, fragment):
-    c, _ = client_factory()
-    r = post(c, **payload)
-    assert r.status_code == 400 and fragment in r.get_json()["error"]
+def test_unparseable_reply_is_unverified_not_crash():
+    c, _ = make_client(fake_response("I could not format this."))
+    d = c.post("/api/analyze", json={"text": "Some news claim to check please"}).get_json()
+    assert d["verdict"] == "unverified" and d["searched"] is False
 
 
-def test_non_json_body(client_factory):
-    c, _ = client_factory()
-    assert c.post("/api/analyze", data="nope", content_type="text/plain").status_code == 400
+def test_validation_and_missing_key():
+    c, _ = make_client(fake_response(GOOD))
+    assert c.post("/api/analyze", json={"text": "short"}).status_code == 400
+    assert c.post("/api/analyze", data="nope").status_code == 400
+    cfg = Config(groq_api_key="")
+    c2 = create_app(cfg, FactCheckService(cfg)).test_client()
+    assert c2.post("/api/analyze", json={"text": "Some news claim to check please"}).status_code == 503
 
 
-def test_search_failure_keeps_ml_and_marks_verification_unavailable(client_factory):
-    c, _ = client_factory(brave=FakeBrave(error=SearchError("rate_limited")), llm=FakeLLM([CLAIMS_JSON]))
-    d = post(c, mode="headline", headline=H).get_json()
-    assert d["ml"]["available"]
-    assert d["verification"]["status"] == "unavailable" and d["verification"]["reason"] == "search_failed"
-    assert d["verification"]["verdict"] is None and any("rate limit" in w for w in d["warnings"])
+def test_groq_errors_become_messages():
+    bad = MagicMock(status_code=401, headers={})
+    c, _ = make_client(bad)
+    r = c.post("/api/analyze", json={"text": "Some news claim to check please"})
+    assert r.status_code == 502 and "API key" in r.get_json()["error"]
 
 
-def test_missing_api_keys(client_factory):
-    class NoBrave(FakeBrave):
-        configured = False
-        def search(self, q, count=6): raise SearchError("missing_key", "no key")
-    class NoLLM(FakeLLM):
-        def chat_json(self, *a, **k): raise LLMError("missing_key")
-    c, _ = client_factory(brave=NoBrave(), llm=NoLLM(configured=False))
-    d = post(c, mode="headline", headline=H).get_json()
-    assert d["ml"]["available"] and d["verification"]["status"] == "unavailable"
-    assert any("heuristic" in w or "GROQ" in w for w in d["warnings"])
-    h = c.get("/api/health").get_json()
-    assert h["services"] == {"brave_configured": False, "groq_configured": False, "groq_model": None}
+def test_compound_model_sends_no_tools():
+    session = MagicMock()
+    session.post.return_value = fake_response(GOOD)
+    cfg = Config(groq_api_key="k", groq_model="groq/compound")
+    create_app(cfg, FactCheckService(cfg, session)).test_client().post("/api/analyze", json={"text": "Some news claim to check please"})
+    assert "tools" not in session.post.call_args.kwargs["json"]
 
 
-def test_llm_not_configured_still_returns_unverified_evidence(client_factory):
-    c, _ = client_factory(llm=FakeLLM(configured=False))
-    d = post(c, mode="headline", headline=H).get_json()
-    assert d["verification"]["reason"] == "llm_not_configured" and d["evidence"]
-
-
-def test_invalid_verifier_output_reported(client_factory):
-    c, _ = client_factory(llm=FakeLLM([CLAIMS_JSON, {"bad": 1}, {"bad": 2}]))
-    d = post(c, mode="headline", headline=H).get_json()
-    assert d["verification"]["reason"] == "verifier_failed" and "validation" in d["verification"]["message"]
-
-
-def test_no_evidence_is_insufficient_not_false(client_factory):
-    c, _ = client_factory(brave=FakeBrave(results=[]), llm=FakeLLM([CLAIMS_JSON]))
-    d = post(c, mode="headline", headline=H).get_json()
-    assert d["verification"]["verdict"] == "insufficient" and "does not" in d["verification"]["summary"]
-
-
-def test_ml_unavailable_does_not_break_verification(client_factory, tmp_path):
-    c, _ = client_factory(artifact_dir=tmp_path / "missing")
-    d = post(c, mode="headline", headline=H).get_json()
-    assert d["ml"]["available"] is False and "prepare_data" in d["ml"]["error"]
-    assert d["verification"]["verdict"] == "contradicted"
-
-
-def test_ml_label_never_changes_factual_verdict(client_factory):
-    """Same evidence -> same verdict regardless of what the classifier says."""
-    c, svc = client_factory()
-    svc.predictor.predict = lambda *a, **k: {"label": "real", "probability": .99, "probabilities": {"fake": .01, "real": .99},
-                                             "model_name": "x", "mode": "headline", "probabilities_calibrated": True,
-                                             "smoke_test_model": False, "disclaimer": "d"}
-    d = post(c, mode="headline", headline=H).get_json()
-    assert d["ml"]["result"]["label"] == "real" and d["verification"]["verdict"] == "contradicted"
-
-
-def test_async_job_flow_and_stages(client_factory):
-    import time
-    c, _ = client_factory()
-    r = c.post("/api/analyze", json={"mode": "headline", "headline": H})
-    assert r.status_code == 202
-    jid = r.get_json()["job_id"]
-    for _ in range(100):
-        s = c.get(f"/api/analyze/{jid}").get_json()
-        if s["status"] != "running":
-            break
-        time.sleep(0.05)
-    assert s["status"] == "done" and all(st["status"] == "done" for st in s["stages"])
-    assert s["result"]["verification"]["verdict"] == "contradicted"
-    assert c.get("/api/analyze/doesnotexist").status_code == 404
-
-
-def test_history_operations(client_factory):
-    c, _ = client_factory()
-    saved = post(c, mode="headline", headline=H, save_history=True).get_json()
-    post(c, mode="headline", headline=H, save_history=False)
-    items = c.get("/api/history").get_json()["items"]
-    assert len(items) == 1 and items[0]["verdict"] == "contradicted" and items[0]["mode"] == "headline"
-    full = c.get(f"/api/history/{saved['id']}").get_json()
-    assert full["evidence"][0]["url"].startswith("https://")
-    assert c.delete(f"/api/history/{saved['id']}").status_code == 200
-    assert c.delete(f"/api/history/{saved['id']}").status_code == 404
-    post(c, mode="headline", headline=H, save_history=True)
-    assert c.delete("/api/history").get_json()["deleted"] == 1
-    assert c.get("/api/history").get_json()["items"] == []
-
-
-def test_health_and_metrics(client_factory, tmp_path):
-    c, _ = client_factory()
-    h = c.get("/api/health").get_json()
-    assert h["status"] == "ok" and h["model"]["trained"] and h["model"]["smoke_test"] is True
-    assert c.get("/api/model/metrics").get_json()["modes"]["both"]["selected_model"]
-    c2, _ = client_factory(artifact_dir=tmp_path / "none")
-    r = c2.get("/api/model/metrics")
-    assert r.status_code == 404 and r.get_json()["trained"] is False
-    assert c2.get("/api/health").get_json()["model"]["trained"] is False
+def test_extract_json_handles_braces_in_strings():
+    assert _extract_json('x {"a": "}{", "b": 1} y') == {"a": "}{", "b": 1}
